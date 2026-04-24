@@ -165,29 +165,66 @@ def save_rgb_depth_video(images_uint8: np.ndarray, depths: np.ndarray,
     print(f"Saved side-by-side video -> {out_path}")
 
 
-def save_point_cloud(world_points: np.ndarray, world_points_conf: np.ndarray,
+def save_point_cloud(depth: np.ndarray, depth_conf: np.ndarray,
+                     intrinsic: np.ndarray, extrinsic_c2w: np.ndarray,
                      images_uint8: np.ndarray, out_path: str,
-                     conf_threshold: float, downsample_factor: int) -> int:
-    """Save a downsampled, confidence-filtered colored PLY point cloud.
+                     conf_threshold: float, downsample_factor: int,
+                     depth_max: float = 0.0) -> int:
+    """Save a colored world-frame PLY by back-projecting per-frame depth.
 
-    world_points:      (S, H, W, 3)
-    world_points_conf: (S, H, W)
-    images_uint8:      (S, H, W, 3) RGB
+    The model's raw ``world_points`` tensor is a normalized latent (not in
+    world coordinates), so we back-project ``depth`` with the per-frame
+    intrinsics and transform by the c2w extrinsic instead. See
+    ``visualize_birdview.py::backproject_frame`` for the same logic.
+
+    Args:
+        depth:          (S, H, W) metric depth
+        depth_conf:     (S, H, W) confidence map
+        intrinsic:      (S, 3, 3) per-frame intrinsics
+        extrinsic_c2w:  (S, 3, 4) per-frame camera-to-world
+        images_uint8:   (S, H, W, 3) RGB
+        conf_threshold: keep pixels with ``depth_conf >= threshold``
+        downsample_factor: spatial stride (apply BEFORE back-projection)
+        depth_max:      drop points farther than this; 0 disables
     """
-    pts = world_points.reshape(-1, 3)
-    conf = world_points_conf.reshape(-1)
-    cols = images_uint8.reshape(-1, 3)
+    S, H, W = depth.shape
+    stride = max(1, downsample_factor)
 
-    mask = np.isfinite(pts).all(axis=-1) & (conf >= conf_threshold)
-    pts = pts[mask]
-    cols = cols[mask]
+    all_pts: list[np.ndarray] = []
+    all_cols: list[np.ndarray] = []
 
-    if downsample_factor > 1:
-        pts = pts[::downsample_factor]
-        cols = cols[::downsample_factor]
+    ys, xs = np.mgrid[0:H:stride, 0:W:stride].astype(np.float32)
+    for i in tqdm(range(S), desc="Back-projecting PLY", unit="frame"):
+        d = depth[i, ::stride, ::stride]
+        c = depth_conf[i, ::stride, ::stride]
+        rgb = images_uint8[i, ::stride, ::stride]
+
+        m = np.isfinite(d) & (d > 0) & (c >= conf_threshold)
+        if depth_max > 0:
+            m &= d <= depth_max
+        if not m.any():
+            continue
+
+        u = xs[m]; v = ys[m]; z = d[m]
+        Ki = intrinsic[i]
+        x_cam = (u - Ki[0, 2]) / Ki[0, 0] * z
+        y_cam = (v - Ki[1, 2]) / Ki[1, 1] * z
+        pts_cam = np.stack([x_cam, y_cam, z], axis=-1)
+        R = extrinsic_c2w[i, :, :3]
+        t = extrinsic_c2w[i, :, 3]
+        pts_world = pts_cam @ R.T + t
+        all_pts.append(pts_world.astype(np.float32))
+        all_cols.append(rgb[m].astype(np.uint8))
+
+    if not all_pts:
+        print("No valid points for PLY; skipping.")
+        return 0
+    pts = np.concatenate(all_pts, axis=0)
+    cols = np.concatenate(all_cols, axis=0)
 
     _write_ply_ascii(out_path, pts, cols)
-    print(f"Saved point cloud ({len(pts):,} pts, conf>={conf_threshold}) -> {out_path}")
+    print(f"Saved point cloud ({len(pts):,} pts, depth_conf>={conf_threshold}, "
+          f"stride={stride}) -> {out_path}")
     return len(pts)
 
 
@@ -260,10 +297,12 @@ def main() -> None:
     p.add_argument("--offload_to_cpu", action=argparse.BooleanOptionalAction, default=True,
                    help="Offload per-frame predictions to CPU during inference (default: on)")
 
-    p.add_argument("--conf_threshold", type=float, default=1.5,
-                   help="Point cloud visibility threshold on world_points_conf")
-    p.add_argument("--downsample_factor", type=int, default=10,
-                   help="Spatial downsampling for point cloud export")
+    p.add_argument("--conf_threshold", type=float, default=3.0,
+                   help="Point cloud visibility threshold on depth_conf")
+    p.add_argument("--downsample_factor", type=int, default=4,
+                   help="Spatial stride (pixels) for point cloud back-projection")
+    p.add_argument("--point_cloud_depth_max", type=float, default=10.0,
+                   help="Drop points with depth > this (meters) from PLY. 0 disables.")
     p.add_argument("--skip_per_frame_npz", action="store_true",
                    help="Skip writing per-frame NPZs (saves disk)")
     p.add_argument("--skip_point_cloud", action="store_true",
@@ -394,12 +433,15 @@ def main() -> None:
     # 4) Point cloud
     if not args.skip_point_cloud:
         save_point_cloud(
-            preds_np["world_points"],
-            preds_np["world_points_conf"],
-            imgs_np,
-            str(out_dir / "point_cloud.ply"),
+            depth=preds_np["depth"][..., 0] if preds_np["depth"].ndim == 4 else preds_np["depth"],
+            depth_conf=preds_np["depth_conf"],
+            intrinsic=preds_np["intrinsic"],
+            extrinsic_c2w=preds_np["extrinsic"],
+            images_uint8=imgs_np,
+            out_path=str(out_dir / "point_cloud.ply"),
             conf_threshold=args.conf_threshold,
             downsample_factor=args.downsample_factor,
+            depth_max=args.point_cloud_depth_max,
         )
 
     # 5) Run config
