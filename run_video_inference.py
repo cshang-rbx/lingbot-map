@@ -10,7 +10,10 @@ This script is a headless (no viser) wrapper around the core `lingbot_map` model
      extrinsic (c2w 3x4), intrinsic (3x3), image (H,W,3 uint8 in preprocessed resolution)
    - `meta.npz`: stacked arrays, intrinsics, c2w extrinsics
    - `rgb_depth.mp4`: RGB | colored depth side-by-side video
-   - `point_cloud.ply`: downsampled colored point cloud (uses world_points_conf to filter)
+   - `point_cloud.ply`: world-frame colored point cloud (back-projected depth)
+   - `bird_view.png`: static top-down bird's-eye image with trajectory overlay
+   - `map.mp4`: animated top-down with current camera position marker
+   - `input_and_map.mp4`: input video concatenated side-by-side with `map.mp4`
    - `run_config.json`: run metadata
 
 Example:
@@ -38,6 +41,21 @@ from tqdm.auto import tqdm
 from lingbot_map.utils.geometry import closed_form_inverse_se3_general
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
+
+# Bird's-eye map helpers live in sibling scripts; imported lazily where needed
+# so users without OpenCV-video deps can still run core inference.
+from visualize_birdview import (
+    collect_world_points,
+    crop_xz_range,
+    render_topdown,
+    draw_trajectory,
+    draw_axes_legend,
+)
+from make_map_video import (
+    render_map_video,
+    extract_target_frames,
+    concat_input_and_map,
+)
 
 
 def extract_video_frames(video_path: str, out_dir: str, target_fps: float) -> list[str]:
@@ -274,6 +292,91 @@ def save_per_frame_npz(output_dir: str, preds_np: dict, images_uint8: np.ndarray
         )
 
 
+def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
+                      args: argparse.Namespace, out_dir: Path) -> None:
+    """Produce bird_view.png, map.mp4, and input_and_map.mp4 from in-memory preds.
+
+    Re-uses the same back-projection helpers as ``visualize_birdview.py`` and
+    ``make_map_video.py`` so the outputs here are byte-identical to running
+    those scripts afterwards on the saved ``meta.npz``.
+    """
+    print("\n── Building bird's-eye map outputs ──")
+    t_map = time.time()
+
+    # Adapter dict with the keys expected by `collect_world_points`.
+    depth_arr = (
+        preds_np["depth"][..., 0] if preds_np["depth"].ndim == 4
+        else preds_np["depth"]
+    )
+    meta_dict = {
+        "depth": depth_arr,
+        "depth_conf": preds_np["depth_conf"],
+        "intrinsic": preds_np["intrinsic"],
+        "extrinsic_c2w": preds_np["extrinsic"],
+        "images": imgs_np,
+    }
+    cams_all = preds_np["extrinsic"][:, :, 3].astype(np.float32)
+    cam_R_all = preds_np["extrinsic"][:, :, :3].astype(np.float32)
+
+    # Static map: back-project + splat (uses same filters as the PLY).
+    pts, cols, _ = collect_world_points(
+        meta_dict,
+        conf_threshold=args.conf_threshold,
+        depth_max=args.point_cloud_depth_max,
+        stride=args.map_pixel_stride,
+        first_k=None,
+        frame_stride=args.map_frame_stride,
+    )
+    if pts.shape[0] == 0:
+        print("No valid points for bird's-eye map; skipping.")
+        return
+
+    # Compute bbox using all camera positions so the full traj fits on-map.
+    bbox, pts, cols = crop_xz_range(
+        pts, cols, cams_all, args.map_percentile_clip, args.map_pad_frac,
+    )
+    print(
+        f"Static map: {pts.shape[0]:,} pts | "
+        f"XZ=[{bbox[0]:.2f},{bbox[1]:.2f}]x[{bbox[2]:.2f},{bbox[3]:.2f}]"
+    )
+
+    img_rgb, bbox = render_topdown(
+        pts, cols, bbox, args.map_resolution, up_axis=args.map_up_axis,
+    )
+    base_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+    # 5a) Static bird_view.png with full trajectory overlay
+    if not args.skip_birdview:
+        bv_bgr = draw_trajectory(img_rgb, cams_all, bbox)
+        bv_bgr = draw_axes_legend(bv_bgr, bbox)
+        bv_path = out_dir / "bird_view.png"
+        cv2.imwrite(str(bv_path), bv_bgr)
+        print(f"Saved bird's-eye image -> {bv_path}  [{bv_bgr.shape[1]}x{bv_bgr.shape[0]}]")
+
+    # 5b) Animated map.mp4 + concat with input video
+    if not args.skip_map_video:
+        map_path = out_dir / "map.mp4"
+        render_map_video(
+            base_bgr, cams_all, cam_R_all, bbox,
+            out_path=str(map_path), fps=args.fps,
+        )
+        try:
+            input_frames = extract_target_frames(args.video_path, args.fps)
+            if input_frames.shape[0] != cams_all.shape[0]:
+                print(
+                    f"Note: input re-sampled to {input_frames.shape[0]} frames, "
+                    f"map has {cams_all.shape[0]}; taking min."
+                )
+            concat_input_and_map(
+                input_frames, str(map_path),
+                str(out_dir / "input_and_map.mp4"), fps=args.fps,
+            )
+        except Exception as e:
+            print(f"Skipping input|map concat: {e}")
+
+    print(f"Bird's-eye outputs done in {time.time() - t_map:.1f}s")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="LingBot-Map video inference (headless)")
     p.add_argument("--video_path", type=str, required=True)
@@ -307,6 +410,24 @@ def main() -> None:
                    help="Skip writing per-frame NPZs (saves disk)")
     p.add_argument("--skip_point_cloud", action="store_true",
                    help="Skip point cloud PLY export")
+
+    # ── Bird's-eye / map video ───────────────────────────────────────────────
+    p.add_argument("--skip_birdview", action="store_true",
+                   help="Skip static bird_view.png export")
+    p.add_argument("--skip_map_video", action="store_true",
+                   help="Skip animated map.mp4 and input_and_map.mp4")
+    p.add_argument("--map_resolution", type=int, default=1400,
+                   help="Longest-side px of the top-down map canvas")
+    p.add_argument("--map_up_axis", type=str, default="y", choices=["x", "y", "z"],
+                   help="World up axis for the top-down projection")
+    p.add_argument("--map_pixel_stride", type=int, default=3,
+                   help="Spatial subsample per frame when building the static map")
+    p.add_argument("--map_frame_stride", type=int, default=1,
+                   help="Temporal subsample of frames used for the static map")
+    p.add_argument("--map_percentile_clip", type=float, default=1.0,
+                   help="XZ bbox percentile trim for the map (each side)")
+    p.add_argument("--map_pad_frac", type=float, default=0.05,
+                   help="Extra XZ padding as a fraction of span")
 
     args = p.parse_args()
 
@@ -447,7 +568,16 @@ def main() -> None:
             depth_max=args.point_cloud_depth_max,
         )
 
-    # 5) Run config
+    # 5) Bird's-eye map (static PNG + animated MP4 + input|map concat)
+    if not (args.skip_birdview and args.skip_map_video):
+        build_map_outputs(
+            preds_np=preds_np,
+            imgs_np=imgs_np,
+            args=args,
+            out_dir=out_dir,
+        )
+
+    # 6) Run config
     cfg = {
         "video_path": os.path.abspath(args.video_path),
         "model_path": os.path.abspath(args.model_path),
