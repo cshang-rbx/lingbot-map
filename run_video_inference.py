@@ -407,6 +407,7 @@ def main() -> None:
     # ── Save outputs ─────────────────────────────────────────────────────────
     # 1) Meta npz with stacked arrays
     meta_path = out_dir / "meta.npz"
+    print(f"Saving meta.npz to {meta_path}")
     np.savez_compressed(
         meta_path,
         depth=preds_np["depth"].astype(np.float32),
@@ -421,6 +422,7 @@ def main() -> None:
 
     # 2) Per-frame NPZ (optional)
     if not args.skip_per_frame_npz:
+        print(f"Saving per-frame NPZ to {out_dir}")
         save_per_frame_npz(str(out_dir), preds_np, imgs_np)
 
     # 3) RGB | depth video
@@ -432,6 +434,7 @@ def main() -> None:
 
     # 4) Point cloud
     if not args.skip_point_cloud:
+        print(f"Saving point cloud to {out_dir / 'point_cloud.ply'}")
         save_point_cloud(
             depth=preds_np["depth"][..., 0] if preds_np["depth"].ndim == 4 else preds_np["depth"],
             depth_conf=preds_np["depth_conf"],
