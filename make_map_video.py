@@ -25,6 +25,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -35,6 +36,7 @@ from visualize_birdview import (
     crop_xz_range,
     render_topdown,
 )
+from video_writer import X265Writer
 
 
 # =============================================================================
@@ -118,8 +120,15 @@ def render_map_video(
     heading_len_m: float = 0.6,
     traj_thickness: int = 2,
     current_radius: int = 7,
+    writer_kwargs: Optional[dict] = None,
 ) -> None:
-    H, W = base_bgr.shape[:2]
+    # libx265 with yuv420p requires even dims; crop by 1px on the short side
+    # of any odd axis so the entire pipeline stays even.
+    H0, W0 = base_bgr.shape[:2]
+    H = (H0 // 2) * 2
+    W = (W0 // 2) * 2
+    if (H, W) != (H0, W0):
+        base_bgr = base_bgr[:H, :W]
     S = cams_world.shape[0]
     # Pre-compute pixel positions for all trajectory points.
     cam_xz = cams_world[:, [0, 2]]
@@ -128,34 +137,32 @@ def render_map_video(
     # Camera forward in world frame: R_c2w @ [0, 0, 1]  (OpenCV-style +Z forward)
     forward_world = cam_R[:, :, 2]  # (S, 3)
 
-    writer = cv2.VideoWriter(
-        out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
-    )
-    for i in tqdm(range(S), desc="Rendering map video", unit="frame"):
-        frame = base_bgr.copy()
+    with X265Writer(out_path, fps=fps, size=(W, H),
+                    **(writer_kwargs or {})) as writer:
+        for i in tqdm(range(S), desc="Rendering map video", unit="frame"):
+            frame = base_bgr.copy()
 
-        # Trajectory up to (and including) i
-        if i > 0:
-            pts = traj_px[: i + 1]
-            cv2.polylines(frame, [pts.reshape(-1, 1, 2)], False,
-                          traj_color, traj_thickness, cv2.LINE_AA)
+            # Trajectory up to (and including) i
+            if i > 0:
+                pts = traj_px[: i + 1]
+                cv2.polylines(frame, [pts.reshape(-1, 1, 2)], False,
+                              traj_color, traj_thickness, cv2.LINE_AA)
 
-        # Heading tick: project +forward_len_m in XZ to pixel space and draw
-        fwd_xz = cam_xz[i] + heading_len_m * forward_world[i, [0, 2]]
-        p_cur = tuple(traj_px[i].tolist())
-        p_fwd = tuple(world_xz_to_px(fwd_xz[None], bbox, (H, W))[0].tolist())
-        cv2.arrowedLine(frame, p_cur, p_fwd, heading_color, 2, cv2.LINE_AA,
-                        tipLength=0.4)
+            # Heading tick: project +forward_len_m in XZ to pixel space and draw
+            fwd_xz = cam_xz[i] + heading_len_m * forward_world[i, [0, 2]]
+            p_cur = tuple(traj_px[i].tolist())
+            p_fwd = tuple(world_xz_to_px(fwd_xz[None], bbox, (H, W))[0].tolist())
+            cv2.arrowedLine(frame, p_cur, p_fwd, heading_color, 2, cv2.LINE_AA,
+                            tipLength=0.4)
 
-        # Current position
-        cv2.circle(frame, p_cur, current_radius + 3, (0, 0, 0), -1, cv2.LINE_AA)
-        cv2.circle(frame, p_cur, current_radius, current_color, -1, cv2.LINE_AA)
+            # Current position
+            cv2.circle(frame, p_cur, current_radius + 3, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, p_cur, current_radius, current_color, -1, cv2.LINE_AA)
 
-        frame = draw_map_legend(frame, bbox, i, S)
-        frame = draw_north_arrow(frame)
-        writer.write(frame)
+            frame = draw_map_legend(frame, bbox, i, S)
+            frame = draw_north_arrow(frame)
+            writer.write(frame)
 
-    writer.release()
     print(f"Saved map video -> {out_path}")
 
 
@@ -200,6 +207,7 @@ def concat_input_and_map(
     map_video_path: str,
     out_path: str,
     fps: float,
+    writer_kwargs: Optional[dict] = None,
 ) -> None:
     """Concat each input frame with its corresponding map frame side-by-side."""
     cap = cv2.VideoCapture(map_video_path)
@@ -219,22 +227,28 @@ def concat_input_and_map(
               f"map={len(map_frames)}; using first {n}.")
 
     # Resize input frames to match map-frame height, preserving aspect.
+    # libx265 with yuv420p requires even width and height, so round to even.
+    def _even(n: int) -> int:
+        return max(2, (n // 2) * 2)
+
     map_h, map_w = map_frames[0].shape[:2]
     in_h, in_w = input_frames_bgr[0].shape[:2]
-    target_h = map_h
-    target_w = max(2, int(round(in_w * target_h / in_h)))
+    target_h = _even(map_h)
+    target_w = _even(int(round(in_w * target_h / in_h)))
+    map_w_even = _even(map_w)
 
-    out_w = target_w + map_w
-    writer = cv2.VideoWriter(
-        out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, target_h)
-    )
-
-    for i in tqdm(range(n), desc="Concat input|map", unit="frame"):
-        in_frame = cv2.resize(input_frames_bgr[i], (target_w, target_h),
-                              interpolation=cv2.INTER_AREA)
-        combined = np.concatenate([in_frame, map_frames[i]], axis=1)
-        writer.write(combined)
-    writer.release()
+    out_w = target_w + map_w_even
+    with X265Writer(out_path, fps=fps, size=(out_w, target_h),
+                    **(writer_kwargs or {})) as writer:
+        for i in tqdm(range(n), desc="Concat input|map", unit="frame"):
+            in_frame = cv2.resize(input_frames_bgr[i], (target_w, target_h),
+                                  interpolation=cv2.INTER_AREA)
+            map_frame = map_frames[i]
+            if map_frame.shape[:2] != (target_h, map_w_even):
+                map_frame = cv2.resize(map_frame, (map_w_even, target_h),
+                                       interpolation=cv2.INTER_AREA)
+            combined = np.concatenate([in_frame, map_frame], axis=1)
+            writer.write(combined)
     print(f"Saved side-by-side video -> {out_path}")
 
 
@@ -268,7 +282,19 @@ def main() -> None:
 
     p.add_argument("--skip_concat", action="store_true",
                    help="Only produce map.mp4, skip side-by-side concat")
+
+    # Video encoding
+    p.add_argument("--video_codec", type=str, default="libx265",
+                   choices=["libx265", "libx264"])
+    p.add_argument("--video_crf", type=int, default=28)
+    p.add_argument("--video_preset", type=str, default="medium")
+
     args = p.parse_args()
+    writer_kwargs = {
+        "codec": args.video_codec,
+        "crf": args.video_crf,
+        "preset": args.video_preset,
+    }
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +336,7 @@ def main() -> None:
     render_map_video(
         base_bgr, cams_all, cam_R_all, bbox,
         out_path=map_path, fps=args.map_fps,
+        writer_kwargs=writer_kwargs,
     )
 
     if args.skip_concat:
@@ -323,7 +350,8 @@ def main() -> None:
         print(f"Note: input re-sampled to {input_frames.shape[0]} frames, "
               f"meta has {S}; taking min.")
     concat_path = str(out_dir / "input_and_map.mp4")
-    concat_input_and_map(input_frames, map_path, concat_path, fps=args.map_fps)
+    concat_input_and_map(input_frames, map_path, concat_path, fps=args.map_fps,
+                         writer_kwargs=writer_kwargs)
 
     print(f"\nDone. Outputs:")
     print(f"  map:        {map_path}")

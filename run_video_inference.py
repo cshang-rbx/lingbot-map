@@ -27,7 +27,10 @@ Example:
 import argparse
 import json
 import os
+import shutil
+import tempfile
 import time
+from typing import Optional
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -56,6 +59,7 @@ from make_map_video import (
     extract_target_frames,
     concat_input_and_map,
 )
+from video_writer import X265Writer
 
 
 def extract_video_frames(video_path: str, out_dir: str, target_fps: float) -> list[str]:
@@ -157,13 +161,18 @@ def colorize_depth(depth: np.ndarray, vmin: float, vmax: float,
 
 
 def save_rgb_depth_video(images_uint8: np.ndarray, depths: np.ndarray,
-                          out_path: str, fps: float) -> None:
+                          out_path: str, fps: float,
+                          writer_kwargs: Optional[dict] = None) -> None:
     """Write side-by-side (RGB | colored-depth) video.
 
     images_uint8: (S, H, W, 3) RGB
     depths:       (S, H, W)
+    writer_kwargs: forwarded to X265Writer (``codec``, ``crf``, ``preset``, ...).
     """
     s, h, w, _ = images_uint8.shape
+    # libx265+yuv420p requires even dims; trim 1 px if needed.
+    h_even = (h // 2) * 2
+    w_even = (w // 2) * 2
     # Robust colormap range from valid depths across sequence (2/98 percentile)
     valid = depths[(depths > 0) & np.isfinite(depths)]
     if valid.size > 0:
@@ -173,13 +182,12 @@ def save_rgb_depth_video(images_uint8: np.ndarray, depths: np.ndarray,
         vmin, vmax = 0.0, 1.0
     print(f"Depth colormap range (p2-p98): [{vmin:.3f}, {vmax:.3f}]")
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (w * 2, h))
-    for i in tqdm(range(s), desc="Writing RGB+depth video", unit="frame"):
-        rgb_bgr = cv2.cvtColor(images_uint8[i], cv2.COLOR_RGB2BGR)
-        depth_bgr = colorize_depth(depths[i], vmin, vmax)
-        writer.write(np.concatenate([rgb_bgr, depth_bgr], axis=1))
-    writer.release()
+    with X265Writer(out_path, fps=fps, size=(w_even * 2, h_even),
+                    **(writer_kwargs or {})) as writer:
+        for i in tqdm(range(s), desc="Writing RGB+depth video", unit="frame"):
+            rgb_bgr = cv2.cvtColor(images_uint8[i], cv2.COLOR_RGB2BGR)[:h_even, :w_even]
+            depth_bgr = colorize_depth(depths[i], vmin, vmax)[:h_even, :w_even]
+            writer.write(np.concatenate([rgb_bgr, depth_bgr], axis=1))
     print(f"Saved side-by-side video -> {out_path}")
 
 
@@ -293,7 +301,8 @@ def save_per_frame_npz(output_dir: str, preds_np: dict, images_uint8: np.ndarray
 
 
 def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
-                      args: argparse.Namespace, out_dir: Path) -> None:
+                      args: argparse.Namespace, out_dir: Path,
+                      writer_kwargs: Optional[dict] = None) -> None:
     """Produce bird_view.png, map.mp4, and input_and_map.mp4 from in-memory preds.
 
     Re-uses the same back-projection helpers as ``visualize_birdview.py`` and
@@ -359,6 +368,7 @@ def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
         render_map_video(
             base_bgr, cams_all, cam_R_all, bbox,
             out_path=str(map_path), fps=args.fps,
+            writer_kwargs=writer_kwargs,
         )
         try:
             input_frames = extract_target_frames(args.video_path, args.fps)
@@ -370,6 +380,7 @@ def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
             concat_input_and_map(
                 input_frames, str(map_path),
                 str(out_dir / "input_and_map.mp4"), fps=args.fps,
+                writer_kwargs=writer_kwargs,
             )
         except Exception as e:
             print(f"Skipping input|map concat: {e}")
@@ -410,6 +421,20 @@ def main() -> None:
                    help="Skip writing per-frame NPZs (saves disk)")
     p.add_argument("--skip_point_cloud", action="store_true",
                    help="Skip point cloud PLY export")
+    p.add_argument("--keep_raw_frames", action="store_true",
+                   help="Keep extracted raw video frames in <output_dir>/raw_frames "
+                        "(default: extract to a tempdir and delete on completion).")
+
+    # ── Video encoding (libx265 by default) ──────────────────────────────────
+    p.add_argument("--video_codec", type=str, default="libx265",
+                   choices=["libx265", "libx264"],
+                   help="ffmpeg codec for output videos. Default HEVC.")
+    p.add_argument("--video_crf", type=int, default=28,
+                   help="CRF quality (lower = larger/higher-quality). "
+                        "Typical range: libx265 23-30, libx264 18-26.")
+    p.add_argument("--video_preset", type=str, default="medium",
+                   help="ffmpeg encoder preset (ultrafast..placebo). "
+                        "Slower = better compression.")
 
     # ── Bird's-eye / map video ───────────────────────────────────────────────
     p.add_argument("--skip_birdview", action="store_true",
@@ -433,16 +458,37 @@ def main() -> None:
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Extract + preprocess frames ──────────────────────────────────────────
+    # Raw extracted frames are only needed during preprocessing. By default we
+    # write them to a tempdir and delete after the run; pass --keep_raw_frames
+    # to retain them under <output_dir>/raw_frames for inspection.
     t0 = time.time()
-    frames_dir = str(out_dir / "raw_frames")
-    paths = extract_video_frames(args.video_path, frames_dir, args.fps)
-    if args.first_k:
-        paths = paths[: args.first_k]
-    if args.stride > 1:
-        paths = paths[:: args.stride]
+    if args.keep_raw_frames:
+        frames_dir = str(out_dir / "raw_frames")
+    else:
+        frames_dir = tempfile.mkdtemp(prefix="lingbot_map_frames_")
+        print(f"Extracting frames to tempdir: {frames_dir}")
+
+    try:
+        paths = extract_video_frames(args.video_path, frames_dir, args.fps)
+        if args.first_k:
+            paths = paths[: args.first_k]
+        if args.stride > 1:
+            paths = paths[:: args.stride]
+        _run_inference_and_save(args, paths, out_dir, t0)
+    finally:
+        if not args.keep_raw_frames:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            print(f"Cleaned up tempdir: {frames_dir}")
+
+
+def _run_inference_and_save(args: argparse.Namespace,
+                             paths: list[str],
+                             out_dir: Path,
+                             t0: float) -> None:
+    """The rest of the pipeline; split out so main() can wrap it in try/finally."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Preprocessing {len(paths)} frames at {args.image_size}-px canonical crop...")
     images = load_and_preprocess_images(
@@ -548,9 +594,14 @@ def main() -> None:
 
     # 3) RGB | depth video
     video_path = out_dir / "rgb_depth.mp4"
+    writer_kwargs = {
+        "codec": args.video_codec,
+        "crf": args.video_crf,
+        "preset": args.video_preset,
+    }
     save_rgb_depth_video(
         imgs_np, preds_np["depth"].squeeze(-1) if preds_np["depth"].ndim == 4 else preds_np["depth"],
-        str(video_path), fps=args.fps,
+        str(video_path), fps=args.fps, writer_kwargs=writer_kwargs,
     )
 
     # 4) Point cloud
@@ -575,6 +626,7 @@ def main() -> None:
             imgs_np=imgs_np,
             args=args,
             out_dir=out_dir,
+            writer_kwargs=writer_kwargs,
         )
 
     # 6) Run config
