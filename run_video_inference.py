@@ -708,3 +708,13 @@ def _run_inference_and_save(args: argparse.Namespace,
 
 if __name__ == "__main__":
     main()
+
+
+"""
+python eval/wandb_upload.py \
+--input /home/builder/workspace/lingbot-map/outputs/data/ \
+--project "sf-video-eval-lingbot-map" \
+--run-name "lingbot-map-rocapture-481f" \
+--ext mp4 \
+--upload-s3 --no-enable-table-view --pair-by directory
+"""
