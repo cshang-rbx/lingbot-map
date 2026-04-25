@@ -41,7 +41,6 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from lingbot_map.utils.geometry import closed_form_inverse_se3_general
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -122,15 +121,13 @@ def build_model(model_path: str, device: torch.device, image_size: int, patch_si
 
 def postprocess_predictions(predictions: dict, image_hw: tuple[int, int]) -> dict:
     """Convert pose encoding to c2w extrinsics + intrinsics; strip batch dim; move to CPU."""
-    extrinsic_w2c, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], image_hw)
-
-    # Lift 3x4 to 4x4 then invert w2c -> c2w
-    e4 = torch.zeros((*extrinsic_w2c.shape[:-2], 4, 4),
-                     device=extrinsic_w2c.device, dtype=extrinsic_w2c.dtype)
-    e4[..., :3, :4] = extrinsic_w2c
-    e4[..., 3, 3] = 1.0
-    e4 = closed_form_inverse_se3_general(e4)
-    extrinsic_c2w = e4[..., :3, :4]
+    # This mirrors the effective geometry used by demo.py + PointCloudViewer:
+    # demo.py stores the inverse in predictions["extrinsic"], then the viewer
+    # immediately inverts it again before unprojecting and drawing cameras.
+    # For headless export we keep the decoded matrix directly as c2w; otherwise
+    # camera rotations/pans leak into the translation column and the top-view
+    # marker appears to swing sideways.
+    extrinsic_c2w, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], image_hw)
 
     predictions["extrinsic"] = extrinsic_c2w
     predictions["intrinsic"] = intrinsic

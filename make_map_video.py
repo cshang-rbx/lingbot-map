@@ -34,6 +34,7 @@ from tqdm.auto import tqdm
 from visualize_birdview import (
     collect_world_points,
     crop_xz_range,
+    get_camera_to_world,
     render_topdown,
 )
 from video_writer import X265Writer
@@ -69,7 +70,7 @@ def draw_map_legend(bgr: np.ndarray, bbox: tuple[float, float, float, float],
         f"X: [{x_min:.2f}, {x_max:.2f}] m",
         f"Z: [{z_min:.2f}, {z_max:.2f}] m",
         f"Frame: {frame_idx + 1:4d} / {total_frames}",
-        "cyan=trajectory  red=current",
+        "cyan=trajectory  red=current  yellow=motion",
     ]
     box_w = 330
     box_h = 22 + 18 * len(lines)
@@ -107,6 +108,39 @@ def draw_north_arrow(bgr: np.ndarray) -> np.ndarray:
 # Map video rendering
 # =============================================================================
 
+def _smoothed_velocity_xz(cams_world: np.ndarray, window: int = 5) -> np.ndarray:
+    """Per-frame smoothed XZ-plane velocity direction (unit vector or zero).
+
+    Computes ``v_i = pos[i + window/2] - pos[i - window/2]`` (clamped to bounds),
+    drops the Y component, and L2-normalizes. Returns shape ``(S, 2)``.
+
+    Smoothing matters because the model's per-frame translation has ~0.02 m
+    jitter on top of motion of similar magnitude, so an unsmoothed Δpos
+    direction would jiggle wildly. A 5-frame window (~0.3 s at 16 fps) is
+    short enough to track real turns and long enough to average out jitter.
+    """
+    S = cams_world.shape[0]
+    half = max(1, window // 2)
+    lo = np.clip(np.arange(S) - half, 0, S - 1)
+    hi = np.clip(np.arange(S) + half, 0, S - 1)
+    v_xyz = cams_world[hi] - cams_world[lo]      # (S, 3)
+    v_xz = v_xyz[:, [0, 2]]                      # (S, 2)
+    norms = np.linalg.norm(v_xz, axis=1, keepdims=True)
+    # Where motion is below noise floor, fall back to nearest non-zero direction.
+    # This makes the arrow stable through pauses rather than flickering.
+    moving = (norms > 1e-3).reshape(-1)
+    if moving.any():
+        last_dir = np.array([0.0, 1.0], dtype=v_xz.dtype)  # default: +Z up in image
+        out = np.zeros_like(v_xz)
+        for i in range(S):
+            if moving[i]:
+                last_dir = v_xz[i] / max(float(norms[i]), 1e-6)
+            out[i] = last_dir
+        return out
+    # No motion at all in the entire sequence.
+    return np.tile(np.array([0.0, 1.0], dtype=v_xz.dtype), (S, 1))
+
+
 def render_map_video(
     base_bgr: np.ndarray,
     cams_world: np.ndarray,          # (S, 3) all camera positions in world
@@ -116,8 +150,9 @@ def render_map_video(
     fps: float,
     traj_color: tuple[int, int, int] = (255, 255, 0),    # BGR: cyan-ish
     current_color: tuple[int, int, int] = (0, 0, 255),   # BGR: red
-    heading_color: tuple[int, int, int] = (0, 255, 255), # BGR: yellow
+    heading_color: tuple[int, int, int] = (0, 255, 255), # BGR: yellow (motion arrow)
     heading_len_m: float = 0.6,
+    heading_smooth_window: int = 5,
     traj_thickness: int = 2,
     current_radius: int = 7,
     writer_kwargs: Optional[dict] = None,
@@ -134,8 +169,12 @@ def render_map_video(
     cam_xz = cams_world[:, [0, 2]]
     traj_px = world_xz_to_px(cam_xz, bbox, (H, W))
 
-    # Camera forward in world frame: R_c2w @ [0, 0, 1]  (OpenCV-style +Z forward)
-    forward_world = cam_R[:, :, 2]  # (S, 3)
+    # Heading from smoothed velocity (direction of motion), NOT from R[:, 2].
+    # The model's predicted camera rotation is unreliable on first-person
+    # walking footage (sometimes 180° flipped relative to direction of travel),
+    # so we derive heading from the position trajectory itself, which is
+    # internally consistent with the bird-view in all cases.
+    motion_dir_xz = _smoothed_velocity_xz(cams_world, window=heading_smooth_window)
 
     with X265Writer(out_path, fps=fps, size=(W, H),
                     **(writer_kwargs or {})) as writer:
@@ -148,10 +187,10 @@ def render_map_video(
                 cv2.polylines(frame, [pts.reshape(-1, 1, 2)], False,
                               traj_color, traj_thickness, cv2.LINE_AA)
 
-            # Heading tick: project +forward_len_m in XZ to pixel space and draw
-            fwd_xz = cam_xz[i] + heading_len_m * forward_world[i, [0, 2]]
+            # Heading tick: project motion direction (smoothed velocity) into pixels.
+            heading_xz = cam_xz[i] + heading_len_m * motion_dir_xz[i]
             p_cur = tuple(traj_px[i].tolist())
-            p_fwd = tuple(world_xz_to_px(fwd_xz[None], bbox, (H, W))[0].tolist())
+            p_fwd = tuple(world_xz_to_px(heading_xz[None], bbox, (H, W))[0].tolist())
             cv2.arrowedLine(frame, p_cur, p_fwd, heading_color, 2, cv2.LINE_AA,
                             tipLength=0.4)
 
@@ -275,6 +314,10 @@ def main() -> None:
                         "(the overlay animation always runs at every frame)")
     p.add_argument("--first_k_static", type=int, default=None,
                    help="Cap number of frames used to build the static map")
+    p.add_argument("--extrinsic_convention", type=str, default="c2w",
+                   choices=["c2w", "w2c"],
+                   help="Convention of the saved extrinsic matrix. Use w2c for "
+                        "older outputs whose extrinsic_c2w key was mislabeled.")
     p.add_argument("--resolution", type=int, default=1400)
     p.add_argument("--up_axis", type=str, default="y", choices=["x", "y", "z"])
     p.add_argument("--percentile_clip", type=float, default=1.0)
@@ -303,11 +346,17 @@ def main() -> None:
     t0 = time.time()
     print(f"Loading {args.meta_path} ...")
     meta = np.load(args.meta_path)
-    meta_dict = {k: meta[k] for k in
-                 ("depth", "depth_conf", "intrinsic", "extrinsic_c2w", "images")}
+    meta_dict = {k: meta[k] for k in ("depth", "depth_conf", "intrinsic", "images")}
+    if "extrinsic_c2w" in meta:
+        meta_dict["extrinsic_c2w"] = meta["extrinsic_c2w"]
+    elif "extrinsic_w2c" in meta:
+        meta_dict["extrinsic_w2c"] = meta["extrinsic_w2c"]
+    else:
+        raise KeyError("meta must contain 'extrinsic_c2w' or 'extrinsic_w2c'")
     S = int(meta_dict["depth"].shape[0])
-    cams_all = meta_dict["extrinsic_c2w"][:, :, 3].astype(np.float32)
-    cam_R_all = meta_dict["extrinsic_c2w"][:, :, :3].astype(np.float32)
+    E_c2w = get_camera_to_world(meta_dict, args.extrinsic_convention).astype(np.float32)
+    cams_all = E_c2w[:, :, 3]
+    cam_R_all = E_c2w[:, :, :3]
     print(f"  {S} frames")
 
     # ── Build static map (back-project + splat) ─────────────────────────────
@@ -318,6 +367,7 @@ def main() -> None:
         stride=args.pixel_stride,
         first_k=args.first_k_static,
         frame_stride=args.frame_stride,
+        extrinsic_convention=args.extrinsic_convention,
     )
     print(f"Static map points: {pts.shape[0]:,}")
 

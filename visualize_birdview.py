@@ -37,6 +37,38 @@ from tqdm.auto import tqdm
 # Geometry helpers
 # =============================================================================
 
+def invert_extrinsics(E: np.ndarray) -> np.ndarray:
+    """Invert a stack of 3x4 or 4x4 rigid transforms, preserving 3x4 output."""
+    E = np.asarray(E)
+    R = E[..., :3, :3]
+    t = E[..., :3, 3:4]
+    R_inv = np.swapaxes(R, -1, -2)
+    t_inv = -(R_inv @ t)
+    return np.concatenate([R_inv, t_inv], axis=-1).astype(E.dtype, copy=False)
+
+
+def get_camera_to_world(meta: dict, convention: str = "c2w") -> np.ndarray:
+    """Return camera-to-world extrinsics from meta arrays.
+
+    ``run_video_inference.py`` writes ``extrinsic_c2w``. Older experimental
+    outputs may have stored a world-to-camera matrix under that key; pass
+    ``convention='w2c'`` to render those without camera pan becoming fake
+    translation.
+    """
+    if convention not in {"c2w", "w2c"}:
+        raise ValueError(f"convention must be 'c2w' or 'w2c', got {convention!r}")
+
+    if "extrinsic_c2w" in meta:
+        E = np.asarray(meta["extrinsic_c2w"])
+    elif "extrinsic_w2c" in meta:
+        E = np.asarray(meta["extrinsic_w2c"])
+        convention = "w2c"
+    else:
+        raise KeyError("meta must contain 'extrinsic_c2w' or 'extrinsic_w2c'")
+
+    return invert_extrinsics(E) if convention == "w2c" else E
+
+
 def backproject_frame(depth: np.ndarray, K: np.ndarray, E_c2w: np.ndarray,
                       image_rgb: np.ndarray, conf: np.ndarray,
                       conf_threshold: float, depth_max: float,
@@ -84,11 +116,13 @@ def backproject_frame(depth: np.ndarray, K: np.ndarray, E_c2w: np.ndarray,
 
 def collect_world_points(meta: dict, conf_threshold: float, depth_max: float,
                          stride: int, first_k: int | None,
-                         frame_stride: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         frame_stride: int,
+                         extrinsic_convention: str = "c2w"
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Back-project every (sub-sampled) frame. Returns (pts, cols, cam_positions)."""
     depth = meta["depth"][..., 0] if meta["depth"].ndim == 4 else meta["depth"]
     K = meta["intrinsic"]
-    E = meta["extrinsic_c2w"]
+    E = get_camera_to_world(meta, extrinsic_convention)
     conf = meta["depth_conf"]
     images = meta["images"]
 
@@ -290,6 +324,10 @@ def main() -> None:
                    help="Temporal subsample of frames")
     p.add_argument("--first_k", type=int, default=None,
                    help="Only use the first K sampled frames")
+    p.add_argument("--extrinsic_convention", type=str, default="c2w",
+                   choices=["c2w", "w2c"],
+                   help="Convention of the saved extrinsic matrix. Use w2c for "
+                        "older outputs whose extrinsic_c2w key was mislabeled.")
     p.add_argument("--percentile_clip", type=float, default=1.0,
                    help="XZ bbox percentile (1 = trim top/bottom 1%)")
     p.add_argument("--pad_frac", type=float, default=0.05,
@@ -300,8 +338,13 @@ def main() -> None:
     t0 = time.time()
     print(f"Loading {args.meta_path} ...")
     meta = np.load(args.meta_path)
-    meta_dict = {k: meta[k] for k in ("depth", "depth_conf", "intrinsic",
-                                      "extrinsic_c2w", "images")}
+    meta_dict = {k: meta[k] for k in ("depth", "depth_conf", "intrinsic", "images")}
+    if "extrinsic_c2w" in meta:
+        meta_dict["extrinsic_c2w"] = meta["extrinsic_c2w"]
+    elif "extrinsic_w2c" in meta:
+        meta_dict["extrinsic_w2c"] = meta["extrinsic_w2c"]
+    else:
+        raise KeyError("meta must contain 'extrinsic_c2w' or 'extrinsic_w2c'")
     S = meta_dict["depth"].shape[0]
     print(f"  {S} frames, {meta_dict['depth'].shape[1:]} depth")
 
@@ -313,6 +356,7 @@ def main() -> None:
         stride=args.pixel_stride,
         first_k=args.first_k,
         frame_stride=args.frame_stride,
+        extrinsic_convention=args.extrinsic_convention,
     )
     print(f"Collected {pts.shape[0]:,} world points ({cams.shape[0]} cam poses)")
 

@@ -165,8 +165,8 @@ Example run on the `travel` sequence from the dataset above (sky masking on, 4 c
 
 ```bash
 python demo.py \
-    --image_folder /path/to/lingbot-map-demo/travel/ \
-    --model_path /path/to/lingbot-map-long.pt \
+    --image_folder /home/builder/workspace/lingbot-map/example/frog_game/ \
+    --model_path /home/builder/workspace/lingbot-map/checkpoints/lingbot-map-long.pt \
     --mask_sky \
     --camera_num_iterations 4 \
     --keyframe_interval 2
