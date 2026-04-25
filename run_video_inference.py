@@ -30,6 +30,7 @@ import os
 import shutil
 import tempfile
 import time
+import zipfile
 from typing import Optional
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -297,6 +298,40 @@ def save_per_frame_npz(output_dir: str, preds_np: dict, images_uint8: np.ndarray
         )
 
 
+def _float32_view(arr: np.ndarray) -> np.ndarray:
+    return np.asarray(arr).astype(np.float32, copy=False)
+
+
+def save_meta_npz(path: Path, arrays: dict[str, np.ndarray],
+                  compression: str) -> None:
+    """Save an NPZ with selectable compression speed.
+
+    np.savez_compressed always uses zlib's default compression level, which is
+    slow for these large dense arrays. Level 1 keeps most of the space savings
+    while cutting save time substantially; ZIP_STORED is fastest if disk space
+    is less important.
+    """
+    if compression == "none":
+        np.savez(path, **arrays)
+        return
+    if compression == "default":
+        np.savez_compressed(path, **arrays)
+        return
+    if compression != "fast":
+        raise ValueError(f"Unknown meta compression mode: {compression}")
+
+    with zipfile.ZipFile(
+        path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=1,
+        allowZip64=True,
+    ) as zf:
+        for name, arr in arrays.items():
+            with zf.open(f"{name}.npy", "w", force_zip64=True) as f:
+                np.lib.format.write_array(f, np.asanyarray(arr), allow_pickle=False)
+
+
 def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
                       args: argparse.Namespace, out_dir: Path,
                       writer_kwargs: Optional[dict] = None) -> None:
@@ -365,6 +400,7 @@ def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
         render_map_video(
             base_bgr, cams_all, cam_R_all, bbox,
             out_path=str(map_path), fps=args.fps,
+            heading_smooth_window=args.map_heading_smooth_window,
             writer_kwargs=writer_kwargs,
         )
         try:
@@ -418,6 +454,13 @@ def main() -> None:
                    help="Skip writing per-frame NPZs (saves disk)")
     p.add_argument("--skip_point_cloud", action="store_true",
                    help="Skip point cloud PLY export")
+    p.add_argument("--meta_compression", type=str, default="fast",
+                   choices=["none", "fast", "default"],
+                   help="meta.npz compression: none is fastest/largest, fast is "
+                        "zlib level 1, default matches np.savez_compressed.")
+    p.add_argument("--skip_meta_world_points", action="store_true",
+                   help="Do not store world_points/world_points_conf in meta.npz. "
+                        "Bird-view/map outputs use depth and do not need them.")
     p.add_argument("--keep_raw_frames", action="store_true",
                    help="Keep extracted raw video frames in <output_dir>/raw_frames "
                         "(default: extract to a tempdir and delete on completion).")
@@ -450,6 +493,9 @@ def main() -> None:
                    help="XZ bbox percentile trim for the map (each side)")
     p.add_argument("--map_pad_frac", type=float, default=0.05,
                    help="Extra XZ padding as a fraction of span")
+    p.add_argument("--map_heading_smooth_window", type=int, default=15,
+                   help="Frame window for averaging the yellow direction arrow "
+                        "in map.mp4. Larger is smoother but turns lag more.")
 
     args = p.parse_args()
 
@@ -571,17 +617,18 @@ def _run_inference_and_save(args: argparse.Namespace,
     # ── Save outputs ─────────────────────────────────────────────────────────
     # 1) Meta npz with stacked arrays
     meta_path = out_dir / "meta.npz"
-    print(f"Saving meta.npz to {meta_path}")
-    np.savez_compressed(
-        meta_path,
-        depth=preds_np["depth"].astype(np.float32),
-        depth_conf=preds_np["depth_conf"].astype(np.float32),
-        world_points=preds_np["world_points"].astype(np.float32),
-        world_points_conf=preds_np["world_points_conf"].astype(np.float32),
-        extrinsic_c2w=preds_np["extrinsic"].astype(np.float32),
-        intrinsic=preds_np["intrinsic"].astype(np.float32),
-        images=imgs_np,
-    )
+    print(f"Saving meta.npz to {meta_path} (compression={args.meta_compression})")
+    meta_arrays = {
+        "depth": _float32_view(preds_np["depth"]),
+        "depth_conf": _float32_view(preds_np["depth_conf"]),
+        "extrinsic_c2w": _float32_view(preds_np["extrinsic"]),
+        "intrinsic": _float32_view(preds_np["intrinsic"]),
+        "images": imgs_np,
+    }
+    if not args.skip_meta_world_points:
+        meta_arrays["world_points"] = _float32_view(preds_np["world_points"])
+        meta_arrays["world_points_conf"] = _float32_view(preds_np["world_points_conf"])
+    save_meta_npz(meta_path, meta_arrays, args.meta_compression)
     print(f"Saved stacked arrays -> {meta_path}")
 
     # 2) Per-frame NPZ (optional)
@@ -638,8 +685,11 @@ def _run_inference_and_save(args: argparse.Namespace,
         "num_scale_frames": args.num_scale_frames,
         "kv_cache_sliding_window": args.kv_cache_sliding_window,
         "camera_num_iterations": args.camera_num_iterations,
+        "map_heading_smooth_window": args.map_heading_smooth_window,
         "use_sdpa": args.use_sdpa,
         "offload_to_cpu": args.offload_to_cpu,
+        "meta_compression": args.meta_compression,
+        "skip_meta_world_points": args.skip_meta_world_points,
         "inference_time_s": inf_time,
         "inference_fps": fps_inf,
         "dtype": str(dtype),

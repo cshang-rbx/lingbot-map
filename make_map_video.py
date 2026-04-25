@@ -108,37 +108,59 @@ def draw_north_arrow(bgr: np.ndarray) -> np.ndarray:
 # Map video rendering
 # =============================================================================
 
-def _smoothed_velocity_xz(cams_world: np.ndarray, window: int = 5) -> np.ndarray:
+def _moving_average_2d(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average with edge padding."""
+    window = max(1, int(window))
+    if window <= 1 or values.shape[0] <= 1:
+        return values.astype(np.float32, copy=False)
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(values, ((pad, pad), (0, 0)), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.stack([
+        np.convolve(padded[:, j], kernel, mode="valid")
+        for j in range(values.shape[1])
+    ], axis=1).astype(np.float32)
+
+
+def _normalize_or_hold(v_xz: np.ndarray, eps: float = 1e-3) -> np.ndarray:
+    """Normalize 2D directions, carrying the last stable direction through pauses."""
+    norms = np.linalg.norm(v_xz, axis=1, keepdims=True)
+    moving = (norms > eps).reshape(-1)
+    if moving.any():
+        last_dir = np.array([0.0, 1.0], dtype=np.float32)
+        out = np.zeros_like(v_xz, dtype=np.float32)
+        for i in range(v_xz.shape[0]):
+            if moving[i]:
+                last_dir = (v_xz[i] / max(float(norms[i]), 1e-6)).astype(np.float32)
+            out[i] = last_dir
+        return out
+    return np.tile(np.array([0.0, 1.0], dtype=np.float32), (v_xz.shape[0], 1))
+
+
+def _smoothed_velocity_xz(cams_world: np.ndarray, window: int = 15) -> np.ndarray:
     """Per-frame smoothed XZ-plane velocity direction (unit vector or zero).
 
-    Computes ``v_i = pos[i + window/2] - pos[i - window/2]`` (clamped to bounds),
-    drops the Y component, and L2-normalizes. Returns shape ``(S, 2)``.
+    Averages XZ camera positions, computes a centered velocity, then averages
+    the unit directions and normalizes again. Returns shape ``(S, 2)``.
 
     Smoothing matters because the model's per-frame translation has ~0.02 m
     jitter on top of motion of similar magnitude, so an unsmoothed Δpos
-    direction would jiggle wildly. A 5-frame window (~0.3 s at 16 fps) is
-    short enough to track real turns and long enough to average out jitter.
+    direction would jiggle wildly.
     """
     S = cams_world.shape[0]
-    half = max(1, window // 2)
+    if S == 0:
+        return np.empty((0, 2), np.float32)
+
+    cam_xz_smooth = _moving_average_2d(cams_world[:, [0, 2]].astype(np.float32), window)
+    half = max(1, int(window) // 2)
     lo = np.clip(np.arange(S) - half, 0, S - 1)
     hi = np.clip(np.arange(S) + half, 0, S - 1)
-    v_xyz = cams_world[hi] - cams_world[lo]      # (S, 3)
-    v_xz = v_xyz[:, [0, 2]]                      # (S, 2)
-    norms = np.linalg.norm(v_xz, axis=1, keepdims=True)
-    # Where motion is below noise floor, fall back to nearest non-zero direction.
-    # This makes the arrow stable through pauses rather than flickering.
-    moving = (norms > 1e-3).reshape(-1)
-    if moving.any():
-        last_dir = np.array([0.0, 1.0], dtype=v_xz.dtype)  # default: +Z up in image
-        out = np.zeros_like(v_xz)
-        for i in range(S):
-            if moving[i]:
-                last_dir = v_xz[i] / max(float(norms[i]), 1e-6)
-            out[i] = last_dir
-        return out
-    # No motion at all in the entire sequence.
-    return np.tile(np.array([0.0, 1.0], dtype=v_xz.dtype), (S, 1))
+    v_xz = cam_xz_smooth[hi] - cam_xz_smooth[lo]
+    dir_xz = _normalize_or_hold(v_xz)
+    dir_xz = _moving_average_2d(dir_xz, window)
+    return _normalize_or_hold(dir_xz, eps=1e-6)
 
 
 def render_map_video(
@@ -152,7 +174,7 @@ def render_map_video(
     current_color: tuple[int, int, int] = (0, 0, 255),   # BGR: red
     heading_color: tuple[int, int, int] = (0, 255, 255), # BGR: yellow (motion arrow)
     heading_len_m: float = 0.6,
-    heading_smooth_window: int = 5,
+    heading_smooth_window: int = 15,
     traj_thickness: int = 2,
     current_radius: int = 7,
     writer_kwargs: Optional[dict] = None,
@@ -322,6 +344,9 @@ def main() -> None:
     p.add_argument("--up_axis", type=str, default="y", choices=["x", "y", "z"])
     p.add_argument("--percentile_clip", type=float, default=1.0)
     p.add_argument("--pad_frac", type=float, default=0.05)
+    p.add_argument("--heading_smooth_window", type=int, default=15,
+                   help="Odd-ish frame window for averaging the yellow camera "
+                        "direction arrow. Larger is smoother but turns lag more.")
 
     p.add_argument("--skip_concat", action="store_true",
                    help="Only produce map.mp4, skip side-by-side concat")
@@ -386,6 +411,7 @@ def main() -> None:
     render_map_video(
         base_bgr, cams_all, cam_R_all, bbox,
         out_path=map_path, fps=args.map_fps,
+        heading_smooth_window=args.heading_smooth_window,
         writer_kwargs=writer_kwargs,
     )
 
