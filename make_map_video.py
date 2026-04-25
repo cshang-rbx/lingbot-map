@@ -61,7 +61,8 @@ def world_xz_to_px(xz: np.ndarray, bbox: tuple[float, float, float, float],
 
 
 def draw_map_legend(bgr: np.ndarray, bbox: tuple[float, float, float, float],
-                    frame_idx: int, total_frames: int) -> np.ndarray:
+                    frame_idx: int, total_frames: int,
+                    heading_label: str = "look") -> np.ndarray:
     x_min, x_max, z_min, z_max = bbox
     H, W = bgr.shape[:2]
     # Semi-transparent legend box
@@ -70,7 +71,7 @@ def draw_map_legend(bgr: np.ndarray, bbox: tuple[float, float, float, float],
         f"X: [{x_min:.2f}, {x_max:.2f}] m",
         f"Z: [{z_min:.2f}, {z_max:.2f}] m",
         f"Frame: {frame_idx + 1:4d} / {total_frames}",
-        "cyan=trajectory  red=current  yellow=motion",
+        f"cyan=trajectory  red=current  yellow={heading_label}",
     ]
     box_w = 330
     box_h = 22 + 18 * len(lines)
@@ -163,6 +164,18 @@ def _smoothed_velocity_xz(cams_world: np.ndarray, window: int = 15) -> np.ndarra
     return _normalize_or_hold(dir_xz, eps=1e-6)
 
 
+def _smoothed_forward_xz(cam_R: np.ndarray, window: int = 15) -> np.ndarray:
+    """Smoothed top-down camera look direction from c2w rotations."""
+    if cam_R.shape[0] == 0:
+        return np.empty((0, 2), np.float32)
+    # OpenCV camera convention: +Z is forward. With c2w rotation, column 2 is
+    # the forward axis expressed in world coordinates.
+    forward_xz = cam_R[:, [0, 2], 2].astype(np.float32)
+    forward_xz = _normalize_or_hold(forward_xz, eps=1e-6)
+    forward_xz = _moving_average_2d(forward_xz, window)
+    return _normalize_or_hold(forward_xz, eps=1e-6)
+
+
 def render_map_video(
     base_bgr: np.ndarray,
     cams_world: np.ndarray,          # (S, 3) all camera positions in world
@@ -175,6 +188,7 @@ def render_map_video(
     heading_color: tuple[int, int, int] = (0, 255, 255), # BGR: yellow (motion arrow)
     heading_len_m: float = 0.6,
     heading_smooth_window: int = 15,
+    heading_source: str = "look",
     traj_thickness: int = 2,
     current_radius: int = 7,
     writer_kwargs: Optional[dict] = None,
@@ -191,12 +205,12 @@ def render_map_video(
     cam_xz = cams_world[:, [0, 2]]
     traj_px = world_xz_to_px(cam_xz, bbox, (H, W))
 
-    # Heading from smoothed velocity (direction of motion), NOT from R[:, 2].
-    # The model's predicted camera rotation is unreliable on first-person
-    # walking footage (sometimes 180° flipped relative to direction of travel),
-    # so we derive heading from the position trajectory itself, which is
-    # internally consistent with the bird-view in all cases.
-    motion_dir_xz = _smoothed_velocity_xz(cams_world, window=heading_smooth_window)
+    if heading_source == "look":
+        heading_dir_xz = _smoothed_forward_xz(cam_R, window=heading_smooth_window)
+    elif heading_source == "motion":
+        heading_dir_xz = _smoothed_velocity_xz(cams_world, window=heading_smooth_window)
+    else:
+        raise ValueError(f"heading_source must be 'look' or 'motion', got {heading_source!r}")
 
     with X265Writer(out_path, fps=fps, size=(W, H),
                     **(writer_kwargs or {})) as writer:
@@ -209,8 +223,8 @@ def render_map_video(
                 cv2.polylines(frame, [pts.reshape(-1, 1, 2)], False,
                               traj_color, traj_thickness, cv2.LINE_AA)
 
-            # Heading tick: project motion direction (smoothed velocity) into pixels.
-            heading_xz = cam_xz[i] + heading_len_m * motion_dir_xz[i]
+            # Heading tick: project smoothed look/motion direction into pixels.
+            heading_xz = cam_xz[i] + heading_len_m * heading_dir_xz[i]
             p_cur = tuple(traj_px[i].tolist())
             p_fwd = tuple(world_xz_to_px(heading_xz[None], bbox, (H, W))[0].tolist())
             cv2.arrowedLine(frame, p_cur, p_fwd, heading_color, 2, cv2.LINE_AA,
@@ -220,7 +234,7 @@ def render_map_video(
             cv2.circle(frame, p_cur, current_radius + 3, (0, 0, 0), -1, cv2.LINE_AA)
             cv2.circle(frame, p_cur, current_radius, current_color, -1, cv2.LINE_AA)
 
-            frame = draw_map_legend(frame, bbox, i, S)
+            frame = draw_map_legend(frame, bbox, i, S, heading_label=heading_source)
             frame = draw_north_arrow(frame)
             writer.write(frame)
 
@@ -347,6 +361,10 @@ def main() -> None:
     p.add_argument("--heading_smooth_window", type=int, default=15,
                    help="Odd-ish frame window for averaging the yellow camera "
                         "direction arrow. Larger is smoother but turns lag more.")
+    p.add_argument("--heading_source", type=str, default="look",
+                   choices=["look", "motion"],
+                   help="Yellow arrow source: camera look direction from rotation, "
+                        "or camera motion direction from trajectory.")
 
     p.add_argument("--skip_concat", action="store_true",
                    help="Only produce map.mp4, skip side-by-side concat")
@@ -412,6 +430,7 @@ def main() -> None:
         base_bgr, cams_all, cam_R_all, bbox,
         out_path=map_path, fps=args.map_fps,
         heading_smooth_window=args.heading_smooth_window,
+        heading_source=args.heading_source,
         writer_kwargs=writer_kwargs,
     )
 

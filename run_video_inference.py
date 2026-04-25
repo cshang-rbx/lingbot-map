@@ -401,6 +401,7 @@ def build_map_outputs(preds_np: dict, imgs_np: np.ndarray,
             base_bgr, cams_all, cam_R_all, bbox,
             out_path=str(map_path), fps=args.fps,
             heading_smooth_window=args.map_heading_smooth_window,
+            heading_source=args.map_heading_source,
             writer_kwargs=writer_kwargs,
         )
         try:
@@ -496,6 +497,10 @@ def main() -> None:
     p.add_argument("--map_heading_smooth_window", type=int, default=15,
                    help="Frame window for averaging the yellow direction arrow "
                         "in map.mp4. Larger is smoother but turns lag more.")
+    p.add_argument("--map_heading_source", type=str, default="look",
+                   choices=["look", "motion"],
+                   help="Yellow arrow source in map.mp4: camera look direction "
+                        "from rotation, or camera motion direction from trajectory.")
 
     args = p.parse_args()
 
@@ -686,6 +691,7 @@ def _run_inference_and_save(args: argparse.Namespace,
         "kv_cache_sliding_window": args.kv_cache_sliding_window,
         "camera_num_iterations": args.camera_num_iterations,
         "map_heading_smooth_window": args.map_heading_smooth_window,
+        "map_heading_source": args.map_heading_source,
         "use_sdpa": args.use_sdpa,
         "offload_to_cpu": args.offload_to_cpu,
         "meta_compression": args.meta_compression,
